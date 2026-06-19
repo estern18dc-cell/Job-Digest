@@ -3,6 +3,7 @@ import json
 import re
 import requests
 from datetime import datetime, timezone
+from dateutil import parser as dateparser
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
@@ -83,6 +84,37 @@ whether it's senior (still worth knowing about, but flag it).
 # -----------------------------------------------------
 
 
+def is_stale(posting, today):
+    """Deterministic backstop: drop postings with a clearly past deadline,
+    or a 'posted' date that's implausibly old, in case the model's own
+    verification missed something. Anything it can't parse is left alone."""
+    deadline = (posting.get("deadline") or "").strip().lower()
+    posted = (posting.get("posted") or "").strip().lower()
+    ongoing_words = {"rolling", "ongoing", "n/a", "none", "unknown", ""}
+
+    if deadline not in ongoing_words:
+        try:
+            d = dateparser.parse(deadline, fuzzy=True, default=today)
+            if d.date() < today.date():
+                return True
+        except (ValueError, OverflowError, TypeError):
+            pass
+
+    if posted not in ongoing_words:
+        try:
+            d = dateparser.parse(posted, fuzzy=True, default=today)
+            if (today.date() - d.date()).days > 180 and deadline in ("rolling", "ongoing", ""):
+                # only auto-drop on staleness if there's no explicit deadline
+                # that would otherwise justify an old posting still being open
+                return True
+            if (today.date() - d.date()).days > 365:
+                return True
+        except (ValueError, OverflowError, TypeError):
+            pass
+
+    return False
+
+
 def load_seen():
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE) as f:
@@ -108,6 +140,24 @@ upcoming deadline). Do thorough searches across the organizations and
 buckets above - aim to use most of your available searches so coverage
 is wide, not shallow. Check careers/jobs pages directly, plus the
 80,000 Hours job board, and any aggregators that cover this space.
+
+VERIFICATION (critical - stale postings have leaked through before):
+Search snippets and cached pages are frequently outdated - some
+postings indexed by search engines are from 2021-2024 and were never
+taken down or deindexed. Do NOT trust a snippet alone. For every
+candidate posting, use the web_fetch tool to open the actual URL and
+confirm, from the live page content itself:
+  (a) the page is currently live (not a 404, not redirecting to a
+      generic "no openings" or expired-jobs page)
+  (b) the listing does not say it is closed, filled, expired, or
+      archived
+  (c) any posted date or deadline shown ON THE PAGE is consistent with
+      it still being open as of TODAY'S DATE above - not a leftover
+      date from a prior year
+If you cannot confirm a posting is currently live and open by fetching
+it, DROP IT - do not include it on the basis of a search snippet alone,
+and do not guess. It is far better to return fewer, verified-live
+postings than to include anything stale.
 
 PRIORITIES, in order:
 1. NEW & FRESHLY-POSTED opportunities matter most. Strongly favor
@@ -150,7 +200,8 @@ If nothing new is found, return []."""
             "model": "claude-sonnet-4-6",
             "max_tokens": 8000,
             "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 20}
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 20},
+                {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 20},
             ],
             "messages": [{"role": "user", "content": prompt}],
         },
@@ -186,6 +237,16 @@ If nothing new is found, return []."""
         except json.JSONDecodeError as e2:
             print(f"DEBUG: Regex fallback also failed: {e2}")
             return []
+
+    # Backstop filter: drop anything that looks stale even if the model
+    # said it verified it (past deadline, or posted >1yr ago / >6mo ago
+    # with no rolling deadline to justify it).
+    today = datetime.now(timezone.utc)
+    before_count = len(postings)
+    postings = [p for p in postings if not is_stale(p, today)]
+    dropped = before_count - len(postings)
+    if dropped:
+        print(f"DEBUG: Dropped {dropped} posting(s) as stale (past deadline / too old)")
 
     # Sort best-first and hard-cap at 10 as a safety net.
     postings.sort(key=lambda p: p.get("score", 0), reverse=True)
